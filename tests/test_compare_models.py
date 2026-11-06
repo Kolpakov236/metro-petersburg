@@ -9,7 +9,6 @@ from test_model import FAST, FEATS, _synthetic   # tests/ без __init__.py: м
 
 SMALL = {"max_rounds": 30, "es_rounds": 5}
 
-
 @pytest.fixture(scope="module")
 def data():
     df = _synthetic()
@@ -80,3 +79,44 @@ def test_frozen_model_untouched():
     if not M.FINAL_JSON.exists():
         pytest.skip("нет model_final.json")
     M.check_frozen(M.load_config())
+
+
+# --- Взвешенные ансамбли (этап 8) ------------------------------------------------
+@pytest.fixture(scope="module")
+def two_raws(data):
+    _, _, train, test = data
+    ra = C.fit_raw(C.LGBMLearner(FEATS, params=dict(FAST), max_rounds=40, es_rounds=5), train, test)
+    rb = C.fit_raw(C.LinearLearner(FEATS), train, test)
+    return ra, rb
+
+
+@pytest.mark.parametrize("w", [0.0, 1.0])
+def test_weighted_ensemble_ends_equal_single_model(data, two_raws, w):
+    _, _, train, test = data
+    ra, rb = two_raws
+    ens = C.combine([ra, rb], [w, 1 - w])
+    one = ra if w == 1.0 else rb
+    for q in M.QUANTILES:
+        np.testing.assert_array_equal(ens.z_cal[q], one.z_cal[q])
+        np.testing.assert_array_equal(ens.z_test[q], one.z_test[q])
+    pd.testing.assert_frame_equal(C.calibrate(ens, train, test, min_cell=50)[0],
+                                  C.calibrate(one, train, test, min_cell=50)[0])
+
+
+def test_choose_w_uses_only_calibration_window(data, two_raws):
+    """w выбирается по окну C из обучения: тестовые строки (и их факт) на выбор не влияют; w — минимум WAPE на C."""
+    _, _, train, test = data
+    ra, rb = two_raws
+    w = C.choose_w(ra, rb, train)
+    noisy_train = train.copy()
+    outside = ~noisy_train.index.isin(ra.cal_index)
+    noisy_train.loc[outside, "y"] = 1e6                   # строки обучения вне C тоже не участвуют
+    assert C.choose_w(ra, rb, noisy_train) == w
+    cal = train.loc[ra.cal_index]
+    wape = lambda ww: np.abs(M.from_z(ww * ra.z_cal[0.5] + (1 - ww) * rb.z_cal[0.5], cal[M.F_REF], "ratio") - cal.y).sum()
+    assert wape(w) <= min(wape(x) for x in C.W_GRID) + 1e-9
+    ens = C.ensembles({"lgbm": ra, "catboost": rb}, train)
+    assert set(ens) == set(C.PAIRS)
+    assert ens["lgbm_catboost"].iters["weights"] == [w, 1 - w]
+    p, _ = C.calibrate(ens["lgbm_catboost"], train, test, min_cell=50)
+    assert (p.q10 <= p.q50).all() and (p.q50 <= p.q90).all()

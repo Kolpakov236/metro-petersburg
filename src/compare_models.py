@@ -13,10 +13,12 @@
     w·ρ(y − xβ) = ρ(w·y − w·xβ), то есть обычная QuantReg на (w·z, w·X);
   - CatBoost — MultiQuantile, одна модель на три квантиля;
   - XGBoost — reg:quantileerror, три модели;
-  - среднее LightGBM и CatBoost — среднее сырых z двух учеников, затем та же поправка.
-Гиперпараметры — умеренные по умолчанию, без подбора. Замороженные модули только импортируются.
-Официальной остаётся замороженная LightGBM; модель лучше неё на мае–августе (ДИ выигрыша выше нуля) помечается
-как кандидат в следующую версию.
+  - ансамбль LightGBM + CatBoost — сырые z учеников усредняются до обратного перевода с весом w, выбранным на окне C
+    внутри обучения фолда (минимум WAPE q50 отложенных моделей), затем та же поправка.
+Гиперпараметры — умеренные по умолчанию, без подбора. Замороженные модули только импортируются. LightGBM берётся
+из кэша сырых прогнозов (data/interim/compare_raw/), если он есть, и не переобучается.
+Официальной остаётся замороженная LightGBM. Кандидат во «вторую версию» — модель с ΔWAPE к ней > 0, 95 % ДИ выше нуля
+и ΔWAPE > 0 хотя бы в 3 фолдах из 4 (май–август).
 """
 import argparse
 import hashlib
@@ -44,7 +46,10 @@ MAX_ROUNDS, ES_ROUNDS = M.MAX_ROUNDS, M.ES_ROUNDS
 PRED_COLS = ["vestibule_id", "station_id", "group", "h", "tau", "hour", "band", "sday", "y", "is_special",
              "is_anomaly", "is_holiday"]
 LABELS = {"lgbm": "LightGBM (замороженная)", "linear": "Линейная квантильная регрессия", "catboost": "CatBoost",
-          "xgboost": "XGBoost", "lgbm_catboost": "Среднее LightGBM и CatBoost"}
+          "xgboost": "XGBoost", "lgbm_catboost": "LightGBM + CatBoost (w по окну C)"}
+PAIRS = {"lgbm_catboost": ("lgbm", "catboost")}                                  # вес w первой модели — по окну C
+W_GRID = np.round(np.arange(0, 1.0001, 0.05), 2)
+MIN_FOLDS = 3                                                                   # кандидат: ΔWAPE > 0 в ≥ 3 фолдах из 4
 
 
 def target(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
@@ -270,12 +275,36 @@ def fit_raw(learner, train: pd.DataFrame, test: pd.DataFrame) -> RawFold:
                    time.perf_counter() - t)
 
 
+def combine(raws: list[RawFold], weights: list[float], info: dict | None = None) -> RawFold:
+    """Ансамбль: взвешенная сумма сырых z учеников по каждому квантилю (до обратного перевода); время — сумма."""
+    a = raws[0]
+    assert all((r.cal_index == a.cal_index).all() and (r.test_index == a.test_index).all() for r in raws)
+    mix = lambda zs: {q: sum(w * z[q] for w, z in zip(weights, zs)) for q in QUANTILES}
+    return RawFold(a.cal_index, mix([r.z_cal for r in raws]), a.test_index, mix([r.z_test for r in raws]),
+                   {**(info or {}), "weights": list(weights)}, sum(r.seconds for r in raws))
+
+
 def average(a: RawFold, b: RawFold) -> RawFold:
-    """Ансамбль: среднее сырых z двух учеников по каждому квантилю; время — сумма."""
-    assert (a.cal_index == b.cal_index).all() and (a.test_index == b.test_index).all()
-    mean = lambda x, y: {q: (x[q] + y[q]) / 2 for q in QUANTILES}
-    return RawFold(a.cal_index, mean(a.z_cal, b.z_cal), a.test_index, mean(a.z_test, b.z_test),
-                   {"a": a.iters, "b": b.iters}, a.seconds + b.seconds)
+    """Ансамбль двух учеников с равными весами."""
+    return combine([a, b], [0.5, 0.5])
+
+
+def choose_w(a: RawFold, b: RawFold, train: pd.DataFrame, grid=W_GRID) -> float:
+    """Вес w модели a в паре: минимум WAPE q50 отложенных моделей на окне C (строки a.cal_index из обучения фолда).
+    Тестовые строки не участвуют; при равенстве — меньший w."""
+    cal = train.loc[a.cal_index]
+    y, f = cal.y.to_numpy(float), cal[M.F_REF].to_numpy(float)
+    err = [np.abs(M.from_z(w * a.z_cal[0.5] + (1 - w) * b.z_cal[0.5], f, "ratio") - y).sum() for w in grid]
+    return float(grid[int(np.argmin(err))])
+
+
+def ensembles(by_name: dict[str, RawFold], train: pd.DataFrame) -> dict[str, RawFold]:
+    """Ансамбли фолда из готовых сырых прогнозов учеников."""
+    out = {}
+    for name, (x, y) in PAIRS.items():
+        w = choose_w(by_name[x], by_name[y], train)
+        out[name] = combine([by_name[x], by_name[y]], [w, 1 - w], {"w": w})
+    return out
 
 
 def calibrate(raw: RawFold, train: pd.DataFrame, test: pd.DataFrame, cells=("band", "h"),
@@ -331,7 +360,7 @@ def run_raw(rows: pd.DataFrame, fold_list: list[BT.Fold], features: list[str], r
         train, test = BT.split(rows, fold)
         for name, learner in learners(features).items():
             path = RAW / f"{name}_{fold.name}_{_key(name, learner, fold, len(train))}.pkl"
-            if reuse and path.exists():
+            if (reuse or name == "lgbm") and path.exists():      # LightGBM — всегда из кэша, без переобучения
                 raw = pickle.loads(path.read_bytes())
             else:
                 raw = fit_raw(learner, train, test)
@@ -339,7 +368,9 @@ def run_raw(rows: pd.DataFrame, fold_list: list[BT.Fold], features: list[str], r
                 path.write_bytes(pickle.dumps(raw))
             raws.setdefault(name, {})[fold.name] = raw
             log(f"  {fold.name}: {name} — {raw.seconds:.0f} с, итераций {raw.iters}", flush=True)
-        raws.setdefault("lgbm_catboost", {})[fold.name] = average(raws["lgbm"][fold.name], raws["catboost"][fold.name])
+        for name, raw in ensembles({n: r[fold.name] for n, r in raws.items()}, train).items():
+            raws.setdefault(name, {})[fold.name] = raw
+            log(f"  {fold.name}: {name} — веса {raw.iters['weights']}", flush=True)
     return raws
 
 
@@ -375,13 +406,19 @@ def summarize(preds: dict[str, pd.DataFrame], calib: pd.DataFrame, ref: str = "l
     out = []
     for name, p in preds.items():
         s = M.summary(p)
-        row = {"model": name, "label": LABELS[name], **s,
-               "seconds_per_fold": calib[calib.model == name].seconds.mean()}
+        res = BT.evaluate(p)
+        allh = res[(res.fold == "все") & (res.slice == "все часы")]
+        row = {"model": name, "label": LABELS[name], **s, "pinball": allh.pinball.mean(),
+               "pinball_norm": allh.pinball_norm.mean(), "seconds_per_fold": calib[calib.model == name].seconds.mean()}
         if name != ref:
             row.update({f"d_{k}": v for k, v in M.compare(base, p).items()})
             row.update({f"danom_{k}": v for k, v in M.compare(base, p, base.is_anomaly).items()})
-            better = row["d_dwape"] > 0 and row["d_lo"] > 0
-            row["verdict"] = ("кандидат в следующую версию" if better else
+            fd = M.fold_delta(base, p)                    # > 0 — модель лучше LightGBM в этом фолде
+            row.update({f"dfold_{f}": v for f, v in fd.items()})
+            row["folds_better"] = int((fd > 0).sum())
+            row["n_folds"] = int(len(fd))
+            better = row["d_dwape"] > 0 and row["d_lo"] > 0 and row["folds_better"] >= min(MIN_FOLDS, len(fd))
+            row["verdict"] = ("кандидат во вторую версию" if better else
                               "не отличима от LightGBM" if row["d_hi"] > 0 else "хуже LightGBM")
         else:
             row["verdict"] = "официальная (заморожена)"
@@ -402,13 +439,16 @@ def _p(x):
 
 
 def markdown(summ: pd.DataFrame) -> str:
-    lines = ["| Модель | WAPE | t+1 / t+2 | Пики | Аномальные | Покрытие | ΔWAPE к LightGBM, п. п. [95 % ДИ] | p DM | "
-             "Обучение, с на фолд | Вывод |", "|---|---|---|---|---|---|---|---|---|---|"]
+    lines = ["| Модель | WAPE | t+1 / t+2 | Пики | Аномальные | Покрытие | Pinball | ΔWAPE к LightGBM, п. п. [95 % ДИ] | "
+             "p DM | Фолдов лучше | Обучение, с на фолд | Вывод |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in summ.itertuples():
         d = "—" if r.model == "lgbm" else f"{_pp(r.d_dwape)} [{_pp(r.d_lo)}; {_pp(r.d_hi)}]"
         p = "—" if r.model == "lgbm" else _p(r.d_p_dm)
+        folds = "—" if r.model == "lgbm" else f"{r.folds_better} из {r.n_folds}"
+        pin = f"{r.pinball:.2f}".replace(".", ",")
         lines.append(f"| {r.label} | {_pct(r.wape)} | {_pct(r.wape_h1)} / {_pct(r.wape_h2)} | {_pct(r.wape_peaks)} | "
-                     f"{_pct(r.wape_anomaly)} | {_pct(r.coverage, 1)} | {d} | {p} | {r.seconds_per_fold:.0f} | {r.verdict} |")
+                     f"{_pct(r.wape_anomaly)} | {_pct(r.coverage, 1)} | {pin} | {d} | {p} | {folds} | "
+                     f"{r.seconds_per_fold:.0f} | {r.verdict} |")
     return "\n".join(lines)
 
 
@@ -433,8 +473,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.september:
         if not (OUT / "summary.csv").exists():
             raise SystemExit("сначала выбор по маю–августу: python -m src.compare_models")
-        if (OUT / "september.csv").exists() and not args.reuse:
-            raise SystemExit("прогон на сентябре уже сделан: reports/compare/september.csv")
+        done = OUT / "september.csv"
+        if done.exists() and set(pd.read_csv(done).model) >= set(LABELS):
+            raise SystemExit("прогон на сентябре всех моделей уже сделан: reports/compare/september.csv")
         panel = M.frozen_panel(cfg, final=True)
         rows = F.add_features(BT.make_rows(panel), panel)
         fold_list = [BT.get_fold("final", final=True)]
